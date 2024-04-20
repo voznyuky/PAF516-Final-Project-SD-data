@@ -1,0 +1,185 @@
+---
+title: "Dorling File"
+author: "Voznyuk"
+date: "4/11/2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=T, fig.width=10, fig.height=6, warning=F, message=F )
+```
+
+# Packages
+
+```{r}
+library( geojsonio )   # read shapefiles
+library( sp )          # work with shapefiles
+library( sf )          # work with shapefiles - simple features format
+library( mclust )      # cluster analysis 
+library( tmap )        # theme maps
+library( ggplot2 )     # graphing 
+library( ggthemes )    # nice formats for ggplots
+library( dplyr )       # data wrangling 
+library( pander )      # formatting RMD tables
+library( tidycensus )
+library( cartogram )  # spatial maps w/ tract size bias reduction
+library( maptools )   # spatial object manipulation 
+```
+
+```{r}
+census_api_key("83278b7c5fdcd26d6035566a6f319b8e40105e98")
+```
+
+## Data Source
+
+```{r}
+crosswalk <- read.csv( "https://raw.githubusercontent.com/DS4PS/cpp-529-master/master/data/cbsatocountycrosswalk.csv",  stringsAsFactors=FALSE, colClasses="character" )
+
+# search for city names by strings, use the ^ anchor for "begins with" 
+
+these.msp <- crosswalk$msaname == grep( "^SAN DIEGO", crosswalk$msaname, value=TRUE ) 
+these.fips <- crosswalk$fipscounty[ these.msp ]
+these.fips <- na.omit( these.fips )
+
+state.fips <- substr( these.fips, 1, 2 )
+county.fips <- substr( these.fips, 3, 5 )
+
+```
+
+```{r, echo=TRUE, eval=TRUE, warning=FALSE, message=FALSE}
+# get the san diego data
+sd.pop <- 
+  get_acs( geography = "tract", variables = "B01003_001", state = state.fips, county = county.fips, geometry = TRUE ) %>% 
+  select( GEOID, estimate ) %>%
+  rename( POP=estimate )
+
+# recode the GEIOD variable to conform with the census data
+# remove the leading zero
+sd.pop$GEOID<-sub( ".","", sd.pop$GEOID )
+
+class(sd.pop)
+```
+
+## Add Census Data
+
+```{r}
+URL <- "https://github.com/DS4PS/cpp-529-master/raw/master/data/ltdb_std_2010_sample.rds"
+census.dat <- readRDS( gzcon( url( URL ) ) )
+
+# merge the pop data for san diego with the census data
+sdd <- merge( sd.pop, census.dat, by.x="GEOID", by.y="tractid" )
+
+# make sure there are no empty polygons
+sdd <- sdd[ ! st_is_empty( sdd ) , ]
+```
+
+## Transform the Shapefile into A Dorling Cartogram**
+
+```{r}
+# convert sf map object to an sp version
+sdd.sp <- as_Spatial( sdd )
+
+
+# project map and remove empty tracts
+sdd.sp <- st_transform( sdd.sp, CRS( "+init=epsg:3395" ) )
+sdd.sp <- sdd.sp[ sdd.sp$POP != 0 & (! is.na( sdd.sp$POP ) ) , ]
+
+# convert census tract polygons to dorling cartogram
+sdd.sp$pop.w <- sdd.sp$POP / 4000 
+
+sd_dorling <- cartogram_dorling( x=sdd.sp, weight="pop.w", k=0.05 )
+
+```
+
+# Add clusters
+```{r}
+keep.these <- c("pnhwht12", "pnhblk12", "phisp12", "pntv12", "pfb12", "polang12", 
+"phs12", "pcol12", "punemp12", "pflabf12", "pprof12", "pmanuf12", 
+"pvet12", "psemp12", "hinc12", "incpc12", "ppov12", "pown12", 
+"pvac12", "pmulti12", "mrent12", "mhmval12", "p30old12", "p10yrs12", 
+"p18und12", "p60up12", "p75up12", "pmar12", "pwds12", "pfhh12")
+
+d1 <- sd_dorling@data
+d2 <- select( d1, keep.these )
+d3 <- apply( d2, 2, scale )
+
+library( mclust )
+set.seed( 1234 )
+fit <- Mclust( d3 )
+sd_dorling$cluster <-  as.factor(fit$classification)
+```
+
+# Add data
+
+```{r}
+
+URL1 <- "https://github.com/DS4PS/cpp-529-fall-2020/raw/main/LABS/data/rodeo/LTDB-2000.rds"
+d1 <- readRDS( gzcon( url( URL1 ) ) )
+
+URL2 <- "https://github.com/DS4PS/cpp-529-fall-2020/raw/main/LABS/data/rodeo/LTDB-2010.rds"
+d2 <- readRDS( gzcon( url( URL2 ) ) )
+
+URLmd <- "https://github.com/DS4PS/cpp-529-fall-2020/raw/main/LABS/data/rodeo/LTDB-META-DATA.rds"
+md <- readRDS( gzcon( url( URLmd ) ) )
+
+d1 <- select( d1, - year )
+d2 <- select( d2, - year )
+
+d <- merge( d1, d2, by="tractid" )
+d <- merge( d, md, by="tractid" )
+
+# filter rural census tracts
+d <- filter( d, urban == "urban" )
+
+# keep variables you want for the merge
+keep.us <- c( "tractid", "mhmval00", "mhmval12" )
+d <- select( d, keep.us )
+
+# adjust 2000 home values for inflation 
+mhv.00 <- d$mhmval00 * 1.28855  
+mhv.10 <- d$mhmval12
+
+# change in MHV in dollars
+mhv.change <- mhv.10 - mhv.00
+
+# remove cases that are less than $1000
+mhv.00[ mhv.00 < 1000 ] <- NA
+
+# change in MHV in percent
+mhv.growth <- 100 * ( mhv.change / mhv.00 )
+
+# omit cases with growth rates above 200%
+mhv.growth[ mhv.growth > 200 ] <- NA
+
+# add variables to the dataframe
+d$mhv.00 <- mhv.00
+d$mhv.10 <- mhv.10
+d$mhv.change <- mhv.change
+d$mhv.growth <- mhv.growth 
+
+# recode the tract ids to numbers that match the LTDB
+x <- d$tractid 
+x <- gsub( "fips", "", x )
+x <- gsub( "-", "", x )
+x <- sub( ".","", x )
+
+# add the recoded tract id
+d$tractid2 <- x 
+
+# Merge the plot with the data needed for the plot
+sdd.dat <- merge( 
+  sd_dorling, d, by.x="GEOID", by.y="tractid2", all.x=TRUE )
+```
+
+# Save Dorling To File 
+```{r}
+# project to standard lat-lon coordinate system
+sdd.dat <- st_transform( sdd.dat, CRS("+proj=longlat +datum=WGS84") )
+
+path <- "/Users/yelenavoznyuk/Documents/ASU Grad School/PAF 516/Final Project"
+
+geojson_write( 
+  sdd.dat, 
+  file=paste( path, "sd_dorling.geojson", sep="" ), 
+  geometry="polygon" )
+```
